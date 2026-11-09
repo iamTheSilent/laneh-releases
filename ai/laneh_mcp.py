@@ -20,7 +20,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date as date_, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -40,12 +40,21 @@ except Exception:  # no zone database (plain Windows Python): Iran has no DST
 STATE = HOME / "mcp.json"
 
 mcp = FastMCP("laneh", instructions=(
-    "Laneh Team planner. First sign_in(email) then confirm_code(code). "
-    "Read the team with list_workspaces / list_members / list_projects / get_path, "
-    "then lay work out with create_project and add_tasks. Tasks are proposals "
-    "until approved in the app, unless draft=False. Day to day: my_tasks, "
-    "team_status, update_task, complete_task, nudge. Assignees get the app's "
-    "notices automatically."))
+    "Laneh Team: a planner for teams (workspaces, projects with a «مسیر تا هدف» "
+    "path of stages, tasks given to people). You work as the person's planning "
+    "assistant, with exactly their rights; owners and admins can manage everything.\n"
+    "Start: sign_in(email) then confirm_code(code), once. list_workspaces gives ids.\n"
+    "See: team_status (whole team), project_report (health, bottlenecks, forecast), "
+    "member_report (one person), recent_activity (what happened), my_tasks, get_path.\n"
+    "Design: create_project, add_tasks (stages come from `after`), update_project, "
+    "update_task, assign_task, approve, remove_tasks, complete_task.\n"
+    "People: list_members (roles, job titles, online), invite, join_requests, "
+    "answer_join, set_member, nudge.\n"
+    "Rules: answer in the person's language (usually Persian). Before changing "
+    "things, show what you'll do and get a yes; people get notices when work is "
+    "given to them, moved away or finished, so say who will be told. Prefer "
+    "matching tasks to job titles and spreading load. Prompts: weekly_review, "
+    "design_project, rebalance."))
 
 
 # ── server calls ────────────────────────────────────────────────────────
@@ -246,19 +255,48 @@ def list_workspaces() -> list[dict]:
 
 @mcp.tool()
 def list_members(workspace: str) -> list[dict]:
-    """Everyone in a workspace: id, name, @handle, job title, role, colour."""
+    """Everyone in a workspace: id, name, @handle, job title, role, colour,
+    and whether they have Laneh open right now (online / last_seen)."""
     out = []
+    now = datetime.now(timezone.utc)
     for m in _all("members", f'workspace="{workspace}"', expand="user"):
         u = m.get("expand", {}).get("user", {}) or {}
+        seen = _parse(m.get("last_seen") or "")
         out.append({
             "user_id": m["user"],
+            "member_id": m["id"],
             "name": (u.get("name") or "").strip(),
             "handle": u.get("handle") or "",
             "title": m.get("title") or "",
             "role": m["role"],
             "color": m.get("color") or 0,
+            "online": bool(seen and now - seen < timedelta(minutes=4)),
+            "last_seen": seen.astimezone(TZ).strftime("%Y-%m-%d %H:%M") if seen else "",
         })
     return out
+
+
+def _parse(iso: str) -> datetime | None:
+    """A PocketBase date ('2026-11-09 10:00:00.000Z') as aware UTC, or None."""
+    if not iso:
+        return None
+    return datetime.strptime(iso[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+def _my_role(workspace: str) -> str:
+    me = _me()
+    for m in _all("members", f'workspace="{workspace}" && user="{me}"'):
+        return m["role"]
+    return ""
+
+
+def _lead(workspace: str) -> bool:
+    return _my_role(workspace) in ("owner", "admin")
+
+
+def _label(m: dict) -> str:
+    """What to call someone: name, @handle, job title, then role."""
+    return m["name"] or ("@" + m["handle"] if m["handle"] else "") or m["title"] or m["role"]
 
 
 @mcp.tool()
@@ -391,15 +429,18 @@ def _ids_in(project_tasks: list[dict], refs: list[str]) -> list[str]:
 
 
 @mcp.tool()
-def add_tasks(project: str, tasks: list[dict], draft: bool = True) -> dict:
+def add_tasks(project: str, tasks: list[dict], draft: bool | None = None) -> dict:
     """Lay tasks out on a project's path. Each task: {key, title, after, assignee,
     due, note, flags}. `after` = keys of earlier tasks in this list, or titles/ids
     of tasks already on the path (a task waits for all of them; that makes the
     stages). `assignee` = a member's name, @handle or id. `due` = '2026-11-20'
-    or '+5'. `flags` ⊂ [urgent, no_rush, long]. draft=True (default) makes them
-    proposals the person approves in the app; draft=False puts them straight
-    on the path."""
+    or '+5'. `flags` ⊂ [urgent, no_rush, long]. draft: True = proposals someone
+    approves in the app; False = straight on the path. Default: straight on
+    if you're an owner/admin, proposals otherwise (the server forces that for
+    members anyway). Show the plan to the person before calling this."""
     p = _call("GET", f"/collections/projects/records/{project}")
+    if draft is None:
+        draft = not _lead(p["workspace"])
     members = list_members(p["workspace"])
     existing = _all("tasks", f'project="{project}" && deleted=false')
     ids: dict[str, str] = {t["title"].strip().lower(): t["id"] for t in existing}
@@ -440,14 +481,19 @@ def add_tasks(project: str, tasks: list[dict], draft: bool = True) -> dict:
 
 @mcp.tool()
 def assign_task(task: str, member: str | None) -> dict:
-    """Give a task to someone (name, @handle or id), or to nobody with None."""
+    """Give a task to someone (name, @handle or id), or to nobody with None.
+    Like the app, the new person hears «کار داد» and whoever had it hears
+    it went to someone else."""
     t = _call("GET", f"/collections/tasks/records/{task}")
     uid = _resolve_member(list_members(t["workspace"]), member)
+    old = t.get("assignee") or ""
     r = _call("PATCH", f"/collections/tasks/records/{task}",
               {"assignee": uid, "client_updated": _now(), "client_meta": _meta()})
-    told = (not r.get("proposed") and uid != (t.get("assignee") or "")
-            and _notify(t["workspace"], uid, r["id"], "assigned"))
-    return {"id": r["id"], "assignee": r.get("assignee") or "", "told_assignee": told}
+    real = not r.get("proposed") and uid != old
+    told = real and _notify(t["workspace"], uid, r["id"], "assigned")
+    told_old = real and bool(old) and _notify(t["workspace"], old, r["id"], "taken")
+    return {"id": r["id"], "assignee": r.get("assignee") or "",
+            "told_assignee": told, "told_previous": told_old}
 
 
 @mcp.tool()
@@ -600,14 +646,284 @@ def team_status(workspace: str) -> dict:
         })
     people = []
     for m in members:
-        open_ = [t for t in tasks if t.get("assignee") == m["user_id"]
-                 and t["status"] != "done" and not t.get("proposed")]
+        # Like the app: given to them, or made by them and given to no one.
+        open_ = [t for t in tasks if (t.get("assignee") or t.get("created_by")) == m["user_id"]
+                 and t["status"] != "done" and not t.get("proposed")
+                 and t.get("bucket") != "idea"]
         people.append({"name": who[m["user_id"]], "role": m["role"], "title": m["title"],
+                       "online": m["online"], "last_seen": m["last_seen"],
                        "open": len(open_),
                        "late": sum(1 for t in open_ if t.get("due") and _short(t["due"]) < today)})
     return {"today": today, "projects": projects, "people": people,
             "proposals_waiting": sum(1 for t in tasks if t.get("proposed")
                                      and t["status"] != "done")}
+
+
+# ── managing: projects and people (owners and admins) ──────────────────
+
+@mcp.tool()
+def update_project(project: str, name: str | None = None, goal: str | None = None,
+                   deadline: str | None = None, description: str | None = None,
+                   icon: str | None = None, strict_order: bool | None = None,
+                   status: str | None = None) -> dict:
+    """Change a project; only what you pass changes. deadline: '2026-12-01',
+    '+30' or '' to clear. status: active, done (finished) or archived.
+    strict_order: True = a task can't start before what it waits for is done."""
+    patch: dict = {"client_updated": _now(), "client_meta": _meta()}
+    for k, v, n in (("name", name, 120), ("goal", goal, 300),
+                    ("description", description, 2000), ("icon", icon, 8)):
+        if v is not None:
+            patch[k] = v[:n]
+    if deadline is not None:
+        patch["deadline"] = _date(deadline)
+    if strict_order is not None:
+        patch["strict_order"] = strict_order
+    if status is not None:
+        if status not in ("active", "done", "archived"):
+            raise ApiError("status: active, done or archived.")
+        patch["status"] = status
+    r = _call("PATCH", f"/collections/projects/records/{project}", patch)
+    return {"id": r["id"], "name": r["name"], "goal": r.get("goal") or "",
+            "deadline": _short(r.get("deadline") or ""), "status": r.get("status")}
+
+
+@mcp.tool()
+def invite(workspace: str, to: str, role: str = "member") -> dict:
+    """Invite someone by email or Laneh ID (@handle) with a role (admin,
+    member, guest). They get an email / an invite in the app and join when
+    they accept. Owners and admins only."""
+    r = _call("POST", "/laneh/invite", {"workspace": workspace, "to": to, "role": role})
+    if r.get("already"):
+        return {"already_member": True}
+    return {"invited": to, "role": role, "code": r.get("code", ""),
+            "link": API.replace("/api", "") + "/join/" + r.get("code", "")}
+
+
+@mcp.tool()
+def join_requests(workspace: str) -> list[dict]:
+    """People who opened an invite link and wait for a yes (owners/admins)."""
+    return [{"id": r["id"], "name": (r.get("name") or "").strip(),
+             "email": r.get("email") or "", "via_link": r.get("code") or "",
+             "asked": _short(r.get("created") or "")}
+            for r in _all("join_requests", f'workspace="{workspace}"')]
+
+
+@mcp.tool()
+def answer_join(request: str, let_in: bool, role: str = "member") -> dict:
+    """Let a link-joiner in with a role (admin, member, guest), or say no."""
+    if not let_in:
+        _call("DELETE", f"/collections/join_requests/records/{request}")
+        return {"refused": request}
+    _call("POST", "/laneh/approve-join", {"request": request, "role": role})
+    return {"let_in": request, "role": role}
+
+
+@mcp.tool()
+def set_member(workspace: str, member: str, role: str | None = None,
+               title: str | None = None, color: int | None = None) -> dict:
+    """Change someone's role (admin, member, guest; owners and admins only,
+    the owner's role never changes), job title (e.g. «طراح») or colour (1-11).
+    You can always set your own title and colour."""
+    members = list_members(workspace)
+    uid = _resolve_member(members, member)
+    row = next(m for m in members if m["user_id"] == uid)
+    patch: dict = {}
+    if role is not None:
+        if role not in ("admin", "member", "guest"):
+            raise ApiError("role: admin, member or guest.")
+        patch["role"] = role
+    if title is not None:
+        patch["title"] = title[:40]
+    if color is not None:
+        patch["color"] = max(0, min(int(color), 11))
+    r = _call("PATCH", f"/collections/members/records/{row['member_id']}", patch)
+    return {"member": _label(row), "role": r["role"], "title": r.get("title") or ""}
+
+
+# ── analysing ──────────────────────────────────────────────────────────
+
+def _usual_time(done: list[dict]) -> str:
+    hours = sorted(_parse(t["done_at"]).astimezone(TZ).hour for t in done if t.get("done_at"))
+    if len(hours) < 3:
+        return ""
+    mid = hours[len(hours) // 2]
+    part = ("morning" if 5 <= mid < 12 else "noon" if mid < 15
+            else "afternoon" if mid < 19 else "night")
+    return f"usually finishes in the {part}, around {mid}:00"
+
+
+def _on_time(done: list[dict]) -> int | None:
+    due = [t for t in done if t.get("due") and t.get("done_at")]
+    if not due:
+        return None
+    ok = sum(1 for t in due if _short(t["done_at"]) <= _short(t["due"]))
+    return round(ok * 100 / len(due))
+
+
+@mcp.tool()
+def member_report(workspace: str, member: str) -> dict:
+    """Everything about one person in a team (owners/admins): online or last
+    seen, open tasks (late first), what they finished and when, when they
+    usually finish, how often on time, and how many «منتظرتم» they sent and
+    got. The same as their page in the app."""
+    members = list_members(workspace)
+    uid = _resolve_member(members, member)
+    m = next(x for x in members if x["user_id"] == uid)
+    tasks = [t for t in _all("tasks", f'workspace="{workspace}" && deleted=false && proposed=false')
+             if (t.get("assignee") or t.get("created_by")) == uid and t.get("bucket") != "idea"]
+    projects = {p["id"]: p["name"] for p in _all("projects", f'workspace="{workspace}"')}
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    open_ = sorted((t for t in tasks if t["status"] != "done"),
+                   key=lambda t: (_short(t.get("due") or "") or "9999"))
+    done = sorted((t for t in tasks if t["status"] == "done"),
+                  key=lambda t: t.get("done_at") or "", reverse=True)
+    week_ago = (datetime.now(TZ) - timedelta(days=7)).strftime("%Y-%m-%d")
+    try:
+        w = _call("GET", "/laneh/member-stats", query={"workspace": workspace, "user": uid})
+    except ApiError:
+        w = {}
+    row = lambda t: {"id": t["id"], "title": t["title"],  # noqa: E731
+                     "project": projects.get(t.get("project") or "", ""),
+                     "due": _short(t.get("due") or "")}
+    return {
+        "name": _label(m), "title": m["title"], "role": m["role"],
+        "online": m["online"], "last_seen": m["last_seen"],
+        "open": [{**row(t), "late": bool(t.get("due")) and _short(t["due"]) < today}
+                 for t in open_],
+        "done_recent": [{**row(t), "done_at": _parse(t["done_at"]).astimezone(TZ)
+                         .strftime("%Y-%m-%d %H:%M") if t.get("done_at") else ""}
+                        for t in done[:20]],
+        "done_total": len(done),
+        "done_last_7_days": sum(1 for t in done if _short(t.get("done_at") or "") >= week_ago),
+        "usual_time": _usual_time(done),
+        "on_time_percent": _on_time(done),
+        "said_waiting": w.get("waiting_sent"), "was_waited_on": w.get("waiting_received"),
+    }
+
+
+@mcp.tool()
+def project_report(project: str) -> dict:
+    """A project's health: progress overall and by stage, late and unassigned
+    tasks, what's blocked, the bottlenecks (open tasks the most others wait
+    on), the pace of the last 4 weeks and, from it, a forecast finish date
+    against the deadline. Use it to say whether a project is on track and why."""
+    p = _call("GET", f"/collections/projects/records/{project}")
+    tasks = [t for t in _all("tasks", f'project="{project}" && deleted=false')
+             if not t.get("proposed")]
+    who = {m["user_id"]: _label(m) for m in list_members(p["workspace"])}
+    stages = _stages(tasks)
+    by = {t["id"]: t for t in tasks}
+    today = datetime.now(TZ).date()
+    is_done = lambda t: t["status"] == "done"  # noqa: E731
+    open_ = [t for t in tasks if not is_done(t)]
+
+    # Everything that waits on a task, directly or further down the path.
+    waiters: dict[str, set] = {t["id"]: set() for t in tasks}
+    for t in tasks:
+        for a in t.get("after") or []:
+            if a in waiters:
+                waiters[a].add(t["id"])
+
+    def downstream(tid: str, seen: set) -> set:
+        for w in waiters.get(tid, ()):
+            if w not in seen:
+                seen.add(w)
+                downstream(w, seen)
+        return seen
+
+    bottlenecks = sorted(
+        ({"title": t["title"], "who": who.get(t.get("assignee") or "", ""),
+          "holds_up": len([x for x in downstream(t["id"], set()) if not is_done(by[x])])}
+         for t in open_), key=lambda x: -x["holds_up"])
+    blocked = [t for t in open_ if any(not is_done(by[a]) for a in t.get("after") or [] if a in by)]
+
+    # Pace: tasks finished per week over the last 4 weeks.
+    since = datetime.now(timezone.utc) - timedelta(days=28)
+    recent = [t for t in tasks if is_done(t) and t.get("done_at") and _parse(t["done_at"]) >= since]
+    pace = len(recent) / 4
+    forecast = (today + timedelta(days=round(len(open_) / pace * 7))) if pace and open_ else None
+    deadline = _short(p.get("deadline") or "")
+    stage_rows = []
+    for s in range(1, max(stages.values(), default=0) + 1):
+        st = [t for t in tasks if stages[t["id"]] == s]
+        stage_rows.append({"stage": s, "done": sum(map(is_done, st)), "tasks": len(st)})
+    return {
+        "project": p["name"], "goal": p.get("goal") or "", "status": p.get("status"),
+        "deadline": deadline,
+        "progress_percent": round(100 * (len(tasks) - len(open_)) / len(tasks)) if tasks else 0,
+        "done": len(tasks) - len(open_), "tasks": len(tasks), "stages": stage_rows,
+        "late": [{"title": t["title"], "due": _short(t["due"]), "who": who.get(t.get("assignee") or "", "")}
+                 for t in open_ if t.get("due") and _short(t["due"]) < today.isoformat()],
+        "unassigned": [t["title"] for t in open_ if not t.get("assignee")],
+        "blocked": len(blocked),
+        "bottlenecks": [b for b in bottlenecks if b["holds_up"]][:5],
+        "pace_per_week": round(pace, 1),
+        "forecast_finish": forecast.isoformat() if forecast else "",
+        "days_behind_deadline": ((forecast - date_.fromisoformat(deadline)).days
+                                 if forecast and deadline else None),
+        "proposals_waiting": len(_all("tasks", f'project="{project}" && deleted=false && proposed=true')),
+    }
+
+
+@mcp.tool()
+def recent_activity(workspace: str, days: int = 7) -> dict:
+    """What happened in a team lately, from its event log: per person how many
+    tasks they made, finished, reopened, assigned; and the latest events with
+    names and task titles. Good for «این هفته چی شد؟»."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    events = _all("events", f'workspace="{workspace}" && created>="{since}"',
+                  expand="task,project", sort="-created")
+    who = {m["user_id"]: _label(m) for m in list_members(workspace)}
+    per: dict[str, dict[str, int]] = {}
+    for e in events:
+        name = who.get(e.get("actor") or "", "someone")
+        per.setdefault(name, {})
+        per[name][e["type"]] = per[name].get(e["type"], 0) + 1
+    latest = []
+    for e in events[:40]:
+        ex = e.get("expand") or {}
+        latest.append({
+            "when": _parse(e["created"]).astimezone(TZ).strftime("%Y-%m-%d %H:%M"),
+            "who": who.get(e.get("actor") or "", "someone"), "what": e["type"],
+            "task": (ex.get("task") or {}).get("title", ""),
+            "project": (ex.get("project") or {}).get("name", ""),
+        })
+    return {"days": days, "by_person": per, "latest": latest}
+
+
+# ── ready-made manager routines (MCP prompts) ──────────────────────────
+
+@mcp.prompt()
+def weekly_review(workspace: str) -> str:
+    """A manager's weekly review of a Laneh team."""
+    return (f"Do a weekly review of Laneh workspace {workspace}, in Persian. "
+            "Call team_status, recent_activity(days=7) and project_report for every "
+            "active project; member_report for anyone with late work. Then write: what "
+            "got done, each project's health (on track / at risk, with the forecast vs "
+            "deadline and the bottleneck), who is overloaded or idle, and 3-5 concrete "
+            "actions (move a task, nudge someone, cut scope, change a deadline). Ask "
+            "before doing any of them.")
+
+
+@mcp.prompt()
+def design_project(workspace: str, goal: str) -> str:
+    """Design a project and its path to a goal, with the team."""
+    return (f"Design a Laneh project in workspace {workspace} for this goal: {goal}. "
+            "Read list_members (job titles, who's online) and team_status (who has "
+            "room). Ask me what's unclear (deadline, scope). Then show the path in "
+            "Persian as stages: each task with who does it (by job title and load), "
+            "what it waits for and a due date that fits the deadline. When I say ok, "
+            "create_project and add_tasks; tell me who got notified.")
+
+
+@mcp.prompt()
+def rebalance(workspace: str) -> str:
+    """Spread the team's work more evenly."""
+    return (f"Look at workload in Laneh workspace {workspace}: team_status, then "
+            "member_report for the busiest and the freest people. Suggest, in Persian, "
+            "which open tasks to move to whom (matching job titles), and which late "
+            "tasks need a new date. Ask me before moving anything; when moving, both "
+            "people are told automatically.")
 
 
 def install() -> None:
