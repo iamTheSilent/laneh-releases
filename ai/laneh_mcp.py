@@ -175,9 +175,24 @@ def _short(iso: str) -> str:
         tzinfo=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d")
 
 
+_CLIENT: str | None = None
+
+
+def _seen(ctx) -> None:
+    """Remember which assistant is calling («Claude Code», «Codex»…)."""
+    global _CLIENT
+    if ctx is not None:
+        name = _client_name(ctx)
+        if name != "AI assistant":
+            _CLIENT = name
+
+
 def _meta() -> dict:
+    """Sent with every change. «ai:<name>» lands in the event log, so the app
+    can say a task was Claude's (or Codex's) doing."""
+    ai = _CLIENT or _state().get("client") or "AI"
     return {"tz": int(datetime.now(TZ).utcoffset().total_seconds() // 60),
-            "platform": "mcp", "version": "1.1"}
+            "platform": ("ai:" + ai)[:16], "version": "1.2"}
 
 
 # ── sign in ────────────────────────────────────────────────────────────
@@ -224,7 +239,7 @@ def confirm_code(code: str, ctx: Context) -> str:
     else:
         conn = _call("POST", "/collections/connections/records",
                      {"user": uid, "client": client, "last_seen": _now()})["id"]
-    _save(connection=conn, seen_at=datetime.now(timezone.utc).timestamp())
+    _save(connection=conn, client=client, seen_at=datetime.now(timezone.utc).timestamp())
     return f"Signed in as {st['email']} (user {uid}), connected as {client}."
 
 
@@ -372,9 +387,10 @@ def get_path(project: str) -> dict:
 @mcp.tool()
 def create_project(workspace: str, name: str, goal: str = "", deadline: str = "",
                    icon: str = "🚀", description: str = "",
-                   strict_order: bool = False) -> dict:
+                   strict_order: bool = False, ctx: Context = None) -> dict:
     """Make a project. deadline: '2026-12-01' or '+30' (days from today).
     Only owners and admins can make projects."""
+    _seen(ctx)
     rid, cid = _new_ids()
     r = _call("POST", "/collections/projects/records", {
         "id": rid, "client_id": cid, "workspace": workspace, "name": name[:120],
@@ -429,7 +445,7 @@ def _ids_in(project_tasks: list[dict], refs: list[str]) -> list[str]:
 
 
 @mcp.tool()
-def add_tasks(project: str, tasks: list[dict], draft: bool | None = None) -> dict:
+def add_tasks(project: str, tasks: list[dict], draft: bool | None = None, ctx: Context = None) -> dict:
     """Lay tasks out on a project's path. Each task: {key, title, after, assignee,
     due, note, flags}. `after` = keys of earlier tasks in this list, or titles/ids
     of tasks already on the path (a task waits for all of them; that makes the
@@ -438,6 +454,7 @@ def add_tasks(project: str, tasks: list[dict], draft: bool | None = None) -> dic
     approves in the app; False = straight on the path. Default: straight on
     if you're an owner/admin, proposals otherwise (the server forces that for
     members anyway). Show the plan to the person before calling this."""
+    _seen(ctx)
     p = _call("GET", f"/collections/projects/records/{project}")
     if draft is None:
         draft = not _lead(p["workspace"])
@@ -480,10 +497,11 @@ def add_tasks(project: str, tasks: list[dict], draft: bool | None = None) -> dic
 
 
 @mcp.tool()
-def assign_task(task: str, member: str | None) -> dict:
+def assign_task(task: str, member: str | None, ctx: Context = None) -> dict:
     """Give a task to someone (name, @handle or id), or to nobody with None.
     Like the app, the new person hears «کار داد» and whoever had it hears
     it went to someone else."""
+    _seen(ctx)
     t = _call("GET", f"/collections/tasks/records/{task}")
     uid = _resolve_member(list_members(t["workspace"]), member)
     old = t.get("assignee") or ""
@@ -497,9 +515,10 @@ def assign_task(task: str, member: str | None) -> dict:
 
 
 @mcp.tool()
-def approve(task_ids: list[str]) -> dict:
+def approve(task_ids: list[str], ctx: Context = None) -> dict:
     """Approve proposals (owners and admins only): they join the path, and
     whoever they're given to hears about it."""
+    _seen(ctx)
     done = []
     for tid in task_ids:
         r = _call("PATCH", f"/collections/tasks/records/{tid}",
@@ -511,8 +530,9 @@ def approve(task_ids: list[str]) -> dict:
 
 
 @mcp.tool()
-def remove_tasks(task_ids: list[str]) -> dict:
+def remove_tasks(task_ids: list[str], ctx: Context = None) -> dict:
     """Take tasks off the path (soft delete, like the app's trash)."""
+    _seen(ctx)
     for tid in task_ids:
         _call("PATCH", f"/collections/tasks/records/{tid}",
               {"deleted": True, "client_updated": _now(), "client_meta": _meta()})
@@ -522,10 +542,11 @@ def remove_tasks(task_ids: list[str]) -> dict:
 @mcp.tool()
 def update_task(task: str, title: str | None = None, note: str | None = None,
                 due: str | None = None, after: list[str] | None = None,
-                flags: list[str] | None = None) -> dict:
+                flags: list[str] | None = None, ctx: Context = None) -> dict:
     """Change a task. Only what you pass changes. due: '2026-11-20', '+3', or ''
     to clear. after: ids or titles of tasks on the same path it waits for
     (replaces the old list; [] = waits for nothing). flags ⊂ [urgent, no_rush, long]."""
+    _seen(ctx)
     t = _call("GET", f"/collections/tasks/records/{task}")
     patch: dict = {"client_updated": _now(), "client_meta": _meta()}
     if title is not None:
@@ -548,10 +569,11 @@ def update_task(task: str, title: str | None = None, note: str | None = None,
 
 
 @mcp.tool()
-def complete_task(task_ids: list[str], done: bool = True) -> dict:
+def complete_task(task_ids: list[str], done: bool = True, ctx: Context = None) -> dict:
     """Tick tasks done (done=False opens them again). Like the app, whoever has
     a task that was waiting on one of these hears it's their turn («تموم شد»).
     Members can only tick their own tasks; the server checks."""
+    _seen(ctx)
     out = []
     for tid in task_ids:
         r = _call("PATCH", f"/collections/tasks/records/{tid}", {
@@ -665,10 +687,11 @@ def team_status(workspace: str) -> dict:
 def update_project(project: str, name: str | None = None, goal: str | None = None,
                    deadline: str | None = None, description: str | None = None,
                    icon: str | None = None, strict_order: bool | None = None,
-                   status: str | None = None) -> dict:
+                   status: str | None = None, ctx: Context = None) -> dict:
     """Change a project; only what you pass changes. deadline: '2026-12-01',
     '+30' or '' to clear. status: active, done (finished) or archived.
     strict_order: True = a task can't start before what it waits for is done."""
+    _seen(ctx)
     patch: dict = {"client_updated": _now(), "client_meta": _meta()}
     for k, v, n in (("name", name, 120), ("goal", goal, 300),
                     ("description", description, 2000), ("icon", icon, 8)):
