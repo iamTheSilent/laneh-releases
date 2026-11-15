@@ -31,7 +31,7 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import Context, FastMCP
     from mcp.server.fastmcp.exceptions import ToolError
 
-API = os.environ.get("LANEH_API", "https://37-32-38-170.sslip.io/api").rstrip("/")
+API = os.environ.get("LANEH_API", "https://api.laneh.space/api").rstrip("/")
 HOME = Path(os.environ.get("LANEH_HOME", Path.home() / ".laneh"))
 try:
     TZ = ZoneInfo(os.environ.get("LANEH_TZ", "Asia/Tehran"))
